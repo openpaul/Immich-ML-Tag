@@ -1,0 +1,24 @@
+[project]
+name = "immich-ml-tag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Paul Saary", email = "github@paulsaary.de" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.31.0",
+    "psycopg2-binary>=2.9.7",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.4.0",
+    "joblib>=1.3.0",
+    "pgvector>=0.2.0",
+]
+
+[project.scripts]
+immich-ml-tag = "immich_ml_tag:main"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
