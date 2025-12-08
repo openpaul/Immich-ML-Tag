@@ -1,7 +1,7 @@
 [project]
 name = "immich-ml-tag"
 version = "0.1.0"
-description = "Add your description here"
+description = "ML-based automatic tagging for Immich photo library"
 readme = "README.md"
 authors = [
     { name = "Paul Saary", email = "github@paulsaary.de" }

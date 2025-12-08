@@ -1,6 +1,8 @@
-import os
+"""Training and inference logic for ML tag classifiers."""
+
+import hashlib
+import logging
 import random
-import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,33 +10,25 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-import psycopg2
-import requests
-from pgvector.psycopg2 import register_vector
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import normalize
 
+from . import api
+from .config import ConfigStore, settings
+from .embeddings import (
+    get_asset_ids_created_since,
+    get_asset_ids_without_tag,
+    get_embeddings_by_asset_ids,
+)
 
-IMMICH_DB = os.environ.get("IMMICH_DB_DATABASE_NAME", "immich")
-IMMICH_DB_USER = os.environ.get("IMMICH_DB_USERNAME", "postgres")
-IMMICH_DB_PASSWORD = os.environ.get("IMMICH_DB_PASSWORD", "yourpassword")
-IMMICH_DB_HOST = os.environ.get("IMMICH_DB_HOST", "localhost")
-IMMICH_API_KEY = os.environ.get("IMMICH_API_KEY", "your_api_key")
-IMMICH_DB_PORT = os.environ.get("IMMICH_DB_PORT", "5433")
-IMMICH_URL = os.environ.get("IMMICH_URL", "https://immich.int.paulsaary.de")
-
-DATABASE_URL = f"postgresql://{IMMICH_DB_USER}:{IMMICH_DB_PASSWORD}@{IMMICH_DB_HOST}:{IMMICH_DB_PORT}/{IMMICH_DB}"
-ML_RESOURCE_PATH = os.environ.get("ML_RESOURCE_PATH", "./ml_resources")
-ML_RESOURCE_PATH = Path(ML_RESOURCE_PATH)
-ML_RESOURCE_PATH.mkdir(parents=True, exist_ok=True)
-
-ML_TAG_SUFFIX = "_predicted"
-CONTRAST_TAG = "ML Negative Examples"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class BinaryEmbeddingClassifier:
+    """A binary classifier for embeddings using Logistic Regression."""
+
     model: LogisticRegression | None = None
 
     def train(
@@ -44,6 +38,18 @@ class BinaryEmbeddingClassifier:
         normalize_embeddings: bool = True,
         C: float = 1.0,
     ) -> float:
+        """
+        Train the classifier on positive and negative embeddings.
+
+        Args:
+            positive: Array of positive example embeddings.
+            negative: Array of negative example embeddings.
+            normalize_embeddings: Whether to L2-normalize embeddings.
+            C: Regularization parameter (inverse of regularization strength).
+
+        Returns:
+            Training accuracy.
+        """
         if normalize_embeddings:
             positive = normalize(positive)
             negative = normalize(negative)
@@ -70,6 +76,7 @@ class BinaryEmbeddingClassifier:
         return accuracy_score(y, preds)
 
     def save(self, path: str | Path) -> None:
+        """Save the model to disk."""
         if self.model is None:
             raise RuntimeError("Model not trained")
 
@@ -79,6 +86,7 @@ class BinaryEmbeddingClassifier:
 
     @classmethod
     def load(cls, path: str | Path) -> "BinaryEmbeddingClassifier":
+        """Load a model from disk."""
         path = Path(path)
         model = joblib.load(path / "model.joblib")
         return cls(model=model)
@@ -88,6 +96,16 @@ class BinaryEmbeddingClassifier:
         embeddings: np.ndarray,
         normalize_embeddings: bool = True,
     ) -> np.ndarray:
+        """
+        Predict probability of positive class.
+
+        Args:
+            embeddings: Array of embeddings to predict.
+            normalize_embeddings: Whether to L2-normalize embeddings.
+
+        Returns:
+            Array of probabilities for the positive class.
+        """
         if self.model is None:
             raise RuntimeError("Model not loaded")
 
@@ -101,411 +119,408 @@ class BinaryEmbeddingClassifier:
         embeddings: np.ndarray,
         threshold: float = 0.5,
     ) -> np.ndarray:
+        """
+        Make binary predictions.
+
+        Args:
+            embeddings: Array of embeddings to predict.
+            threshold: Probability threshold for positive class.
+
+        Returns:
+            Array of binary predictions.
+        """
         probs = self.predict_proba(embeddings)
         return (probs >= threshold).astype(np.int64)
 
 
-@dataclass
-class Model:
-    tag: str
-    model_path: Path
-    last_trained: datetime | None = None
+def compute_training_data_hash(
+    positive_asset_ids: list[str],
+    manual_negative_asset_ids: list[str],
+) -> str:
+    """
+    Compute a hash of the training data to detect changes.
+
+    Only includes user-tagged positives and manually tagged negatives,
+    not the random background samples.
+
+    Args:
+        positive_asset_ids: List of positive (user-tagged) asset IDs.
+        manual_negative_asset_ids: List of manually tagged negative asset IDs.
+
+    Returns:
+        SHA256 hash of the sorted asset ID lists.
+    """
+    # Sort both lists for consistent hashing
+    sorted_positives = sorted(positive_asset_ids)
+    sorted_negatives = sorted(manual_negative_asset_ids)
+
+    # Create a string representation
+    data = f"pos:{','.join(sorted_positives)}|neg:{','.join(sorted_negatives)}"
+
+    # Compute hash
+    return hashlib.sha256(data.encode()).hexdigest()
 
 
-class Config:
-    def __init__(self, folder: Path = ML_RESOURCE_PATH):
-        self.folder = folder
-        self._init_storage()
-
-    def _init_storage(self):
-        self.db_path = self.folder / "config.db"
-        self.conn = sqlite3.connect(self.db_path)
-        self.cur = self.conn.cursor()
-        self.cur.execute("""
-            CREATE TABLE IF NOT EXISTS config (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                last_inference DATETIME,
-                last_trained DATETIME
-            )
-        """)
-        self.cur.execute(
-            "CREATE TABLE IF NOT EXISTS models (tag TEXT PRIMARY KEY, model_path TEXT)"
-        )
-        self.conn.commit()
-
-    def _delete_all_models(self):
-        self.cur.execute("DELETE FROM models")
-        self.conn.commit()
-
-    def get_models(self) -> list[Model]:
-        self.cur.execute("SELECT tag, model_path FROM models")
-        data = self.cur.fetchall()
-        models = []
-        for tag, model_path in data:
-            models.append(Model(tag=tag, model_path=Path(model_path)))
-        return models
-
-    # getter and setter for last trained and last inference
-    @property
-    def last_trained(self) -> datetime | None:
-        self.cur.execute("SELECT last_trained FROM config")
-        data = self.cur.fetchone()
-        if data is None or data[0] is None:
-            return None
-        return datetime.fromisoformat(data[0])
-
-    @last_trained.setter
-    def last_trained(self, value: datetime):
-        self.cur.execute(
-            "INSERT OR REPLACE INTO config (id, last_trained) VALUES (1, ?)",
-            (value.isoformat(),),
-        )
-        self.conn.commit()
-
-    @property
-    def last_inference(self) -> datetime | None:
-        self.cur.execute("SELECT last_inference FROM config")
-        data = self.cur.fetchone()
-        if data is None or data[0] is None:
-            return None
-        return datetime.fromisoformat(data[0])
-
-    @last_inference.setter
-    def last_inference(self, value: datetime):
-        self.cur.execute(
-            "INSERT OR REPLACE INTO config (id, last_inference) VALUES (1, ?)",
-            (value.isoformat(),),
-        )
-        self.conn.commit()
-
-    @property
-    def tags(self):
-        # fetch tags from API
-        response = requests.get(f"{IMMICH_URL}/api/tags", headers=get_headers())
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise ValueError(f"Error fetching asset: {response.text}")
-
-
-def get_assets_by_tag(tagIds: list[str]) -> list[str]:
-    def _get_asset_tag_page(tagIds: list[str], page: int) -> list[str]:
-        response = requests.post(
-            f"{IMMICH_URL}/api/search/metadata",
-            headers=get_headers(),
-            json={
-                "tagIds": tagIds,
-                "page": page,
-            },
-        )
-        if response.status_code == 200:
-            assets = response.json()
-            return assets["assets"]
-        else:
-            raise ValueError(f"Error fetching assets by tag: {response.text}")
-
-    asset_ids = []
-    page = 1
-    while True:
-        assets = _get_asset_tag_page(tagIds, page)
-        if not assets or "items" not in assets:
-            break
-        elif len(assets["items"]) == 0:
-            break
-        else:
-            asset_ids.extend([asset["id"] for asset in assets["items"]])
-            page += 1
-    return asset_ids
-
-
-def get_embeddings() -> dict[str, np.ndarray]:
-    """Get all embeddings from the database."""
-    conn = psycopg2.connect(
-        dbname=IMMICH_DB,
-        user=IMMICH_DB_USER,
-        password=IMMICH_DB_PASSWORD,
-        host=IMMICH_DB_HOST,
-        port=IMMICH_DB_PORT,
-    )
-    register_vector(conn)
-
-    cur = conn.cursor()
-    cur.execute('SELECT "assetId", embedding FROM smart_search')
-    data = cur.fetchall()
-
-    embeddings = {str(asset_id): embedding for asset_id, embedding in data}
-    cur.close()
-    conn.close()
-    return embeddings
-
-
-def get_embeddings_by_asset_ids(asset_ids: list[str]) -> dict[str, np.ndarray]:
-    """Get embeddings for specific asset IDs."""
-    if not asset_ids:
-        return {}
-
-    conn = psycopg2.connect(
-        dbname=IMMICH_DB,
-        user=IMMICH_DB_USER,
-        password=IMMICH_DB_PASSWORD,
-        host=IMMICH_DB_HOST,
-        port=IMMICH_DB_PORT,
-    )
-    register_vector(conn)
-
-    cur = conn.cursor()
-    # Use ANY to query multiple asset IDs efficiently, cast to uuid[]
-    cur.execute(
-        'SELECT "assetId", embedding FROM smart_search WHERE "assetId" = ANY(%s::uuid[])',
-        (asset_ids,),
-    )
-    data = cur.fetchall()
-
-    embeddings = {str(asset_id): embedding for asset_id, embedding in data}
-    cur.close()
-    conn.close()
-    return embeddings
-
-
-def get_random_asset_ids_without_tag(
-    tag_id: str, exclude_asset_ids: list[str] | None = None
+def get_negative_samples(
+    tag_id: str,
+    positive_asset_ids: list[str],
+    contrast_tag_id: str | None = None,
+    max_ratio: int = 4,
 ) -> list[str]:
     """
-    Get a random sample of asset IDs that do NOT have the specified tag.
-    Uses the database to get all asset IDs with embeddings, then filters out those with the tag.
+    Get negative sample asset IDs for training.
+
+    Args:
+        tag_id: The tag ID to get negatives for.
+        positive_asset_ids: List of positive asset IDs to exclude.
+        contrast_tag_id: Optional tag ID for explicit negative examples.
+        max_ratio: Maximum ratio of negatives to positives.
+
+    Returns:
+        List of negative asset IDs.
     """
-    # Get all assets that have the tag
-    assets_with_tag = set(get_assets_by_tag([tag_id]))
+    # Get assets with the tag to exclude
+    tagged_assets = set(api.get_assets_by_tag([tag_id]))
 
-    # Get all asset IDs that have embeddings
-    conn = psycopg2.connect(
-        dbname=IMMICH_DB,
-        user=IMMICH_DB_USER,
-        password=IMMICH_DB_PASSWORD,
-        host=IMMICH_DB_HOST,
-        port=IMMICH_DB_PORT,
+    # Get all potential negative assets
+    negative_asset_ids = get_asset_ids_without_tag(
+        tagged_assets, exclude_asset_ids=set(positive_asset_ids)
     )
 
-    cur = conn.cursor()
-    cur.execute('SELECT "assetId" FROM smart_search')
-    all_asset_ids = {row[0] for row in cur.fetchall()}
-    cur.close()
-    conn.close()
+    # Limit to max_ratio * positives
+    if len(negative_asset_ids) > max_ratio * len(positive_asset_ids):
+        negative_asset_ids = random.sample(
+            negative_asset_ids, max_ratio * len(positive_asset_ids)
+        )
 
-    # Filter out assets that have the tag
-    assets_without_tag = all_asset_ids - assets_with_tag
+    # Add explicit contrast examples if available
+    if contrast_tag_id:
+        contrast_assets = api.get_assets_by_tag([contrast_tag_id])
+        negative_asset_ids.extend(contrast_assets)
 
-    # Also exclude any additional asset IDs if provided
-    if exclude_asset_ids:
-        assets_without_tag -= set(exclude_asset_ids)
-
-    # Random sample
-    return list(assets_without_tag)
+    return negative_asset_ids
 
 
-def get_headers():
-    return {
-        "x-api-key": IMMICH_API_KEY,
-        "x-immich-app-name": "immich-ml-tags",
-    }
-
-
-def create_ml_tag(ml_tag_name: str, parent_id: str) -> str:
-    # use put tags
-    response = requests.post(
-        f"{IMMICH_URL}/api/tags",
-        headers=get_headers(),
-        json={"name": ml_tag_name, "parentId": parent_id},
-    )
-    if response.status_code == 201:
-        tag = response.json()
-        return tag["id"]
-    else:
-        raise ValueError(f"Error creating ML tag {ml_tag_name}: {response.text}")
-
-
-def delete_ml_tag(ml_tag_id: str) -> None:
-    # use delete tags
-    response = requests.delete(
-        f"{IMMICH_URL}/api/tags/{ml_tag_id}",
-        headers=get_headers(),
-    )
-    if response.status_code == 204:
-        return
-    else:
-        logger.warning(f"Error deleting ML tag {ml_tag_id}: {response.text}")
-
-
-def bulk_tag_assets(asset_ids: list[str], tag_ids: list[str]) -> int:
+def train_single_tag(
+    tag: dict,
+    contrast_tag_id: str,
+    config_store: ConfigStore,
+    min_samples: int = 10,
+    threshold: float = 0.5,
+    force: bool = False,
+) -> bool:
     """
-    Add multiple tags to multiple assets in a single request.
-    Returns the count of assets tagged.
+    Train a classifier for a single tag and run inference.
+
+    Args:
+        tag: The tag dictionary from the API.
+        contrast_tag_id: ID of the contrast (negative examples) parent tag.
+        config_store: Configuration store instance.
+        min_samples: Minimum positive samples required.
+        threshold: Prediction threshold for tagging.
+        force: If True, retrain even if training data hasn't changed.
+
+    Returns:
+        True if training was successful.
     """
-    if not asset_ids or not tag_ids:
-        return 0
+    tag_name = tag["name"]
+    tag_id = tag["id"]
+    ml_tag_name = f"{tag_name}{settings.ml_tag_suffix}"
 
-    response = requests.put(
-        f"{IMMICH_URL}/api/tags/assets",
-        headers=get_headers(),
-        json={
-            "assetIds": asset_ids,
-            "tagIds": tag_ids,
-        },
-    )
-    if response.status_code == 200:
-        result = response.json()
-        return result.get("count", 0)
-    else:
-        raise ValueError(f"Error bulk tagging assets: {response.text}")
+    logger.info(f"Processing tag '{tag_name}' (id: {tag_id})")
 
+    # Get ML tag if it exists
+    ml_tag = api.get_tag_by_name(ml_tag_name)
+    ml_tag_id = ml_tag["id"] if ml_tag else None
 
-if __name__ == "__main__":
-    asset_id = "1c317da1-07e1-4491-8f35-e7408e4d44c5"
-
-    config = Config()
-    # get all tags
-    tags = config.tags
-    tag_names = [tag["name"] for tag in tags]
-
-    import logging
-
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
+    # Get or create negative examples tag under contrast parent
     try:
-        create_ml_tag(CONTRAST_TAG, None)
-    except Exception:
-        pass
-    contrast_tag = next(t for t in config.tags if t["name"] == CONTRAST_TAG)
+        api.create_tag(tag_name, contrast_tag_id)
+    except ValueError:
+        logger.debug(f"Negative tag '{tag_name}' already exists under contrast parent")
+
+    negative_parent_tag = api.get_tag_by_name(tag_name, parent_id=contrast_tag_id)
+    if not negative_parent_tag:
+        logger.warning(f"Could not find/create negative tag for '{tag_name}'")
+        return False
+    negative_tag_id = negative_parent_tag["id"]
+
+    # Get positive asset IDs
+    positive_asset_ids = api.get_assets_by_tag([tag_id])
+
+    # Exclude assets only tagged with the predicted tag (not manually tagged)
+    if ml_tag_id:
+        ml_tagged_assets = set(api.get_assets_by_tag([ml_tag_id]))
+        positive_asset_ids = list(set(positive_asset_ids) - ml_tagged_assets)
+
+    logger.info(f"Found {len(positive_asset_ids)} positive assets")
+
+    if len(positive_asset_ids) < min_samples:
+        logger.info(f"Skipping '{tag_name}': less than {min_samples} samples")
+        return False
+
+    # Get manually tagged negative examples (contrast examples for this tag)
+    manual_negative_asset_ids = api.get_assets_by_tag([negative_tag_id])
+
+    # Compute hash of training data (user-tagged positives + manual negatives)
+    current_hash = compute_training_data_hash(
+        positive_asset_ids, manual_negative_asset_ids
+    )
+    stored_hash = config_store.get_training_data_hash(tag_name)
+
+    if not force and stored_hash == current_hash:
+        logger.info(
+            f"Skipping '{tag_name}': training data unchanged (hash: {current_hash[:12]}...)"
+        )
+        return False
+
+    logger.info(
+        f"Training data changed for '{tag_name}' (new hash: {current_hash[:12]}...)"
+    )
+
+    # Get negative samples (includes manual negatives + random background samples)
+    negative_asset_ids = get_negative_samples(
+        tag_id, positive_asset_ids, negative_tag_id
+    )
+    logger.info(
+        f"Selected {len(negative_asset_ids)} negative assets (including {len(manual_negative_asset_ids)} manual)"
+    )
+
+    # Get embeddings
+    all_asset_ids = positive_asset_ids + negative_asset_ids
+    embeddings_dict = get_embeddings_by_asset_ids(all_asset_ids)
+
+    positive_embeddings = np.array(
+        [embeddings_dict[aid] for aid in positive_asset_ids if aid in embeddings_dict]
+    )
+    negative_embeddings = np.array(
+        [embeddings_dict[aid] for aid in negative_asset_ids if aid in embeddings_dict]
+    )
+
+    logger.info(
+        f"Training with {len(positive_embeddings)} positive and "
+        f"{len(negative_embeddings)} negative embeddings"
+    )
+
+    # Train classifier
+    classifier = BinaryEmbeddingClassifier()
+    accuracy = classifier.train(positive_embeddings, negative_embeddings)
+    logger.info(f"Trained model with accuracy: {accuracy:.4f}")
+
+    # Save model with training data hash
+    model_path = settings.ml_resource_path / ml_tag_name
+    classifier.save(model_path)
+    config_store.register_model(tag_name, model_path, current_hash)
+    logger.info(f"Saved model to {model_path}")
+
+    # Manage ML tag (delete and recreate to clear old predictions)
+    if ml_tag_id:
+        api.delete_tag(ml_tag_id)
+        # Wait for deletion to propagate
+        for _ in range(5):
+            time.sleep(2)
+            try:
+                api.create_tag(ml_tag_name, tag_id)
+                break
+            except ValueError:
+                logger.debug("Waiting for tag deletion to propagate...")
+    else:
+        api.create_tag(ml_tag_name, tag_id)
+
+    # Get the new ML tag ID
+    ml_tag = api.get_tag_by_name(ml_tag_name)
+    if not ml_tag:
+        logger.error(f"Failed to create ML tag '{ml_tag_name}'")
+        return False
+    ml_tag_id = ml_tag["id"]
+
+    # Run inference on all untagged assets
+    tagged_assets = set(api.get_assets_by_tag([tag_id]))
+    inference_asset_ids = get_asset_ids_without_tag(
+        tagged_assets, exclude_asset_ids=set(positive_asset_ids)
+    )
+    logger.info(f"Running inference on {len(inference_asset_ids)} assets")
+
+    if inference_asset_ids:
+        inference_embeddings = get_embeddings_by_asset_ids(inference_asset_ids)
+        inference_array = np.array(
+            [
+                inference_embeddings[aid]
+                for aid in inference_asset_ids
+                if aid in inference_embeddings
+            ]
+        )
+
+        if len(inference_array) > 0:
+            predictions = classifier.predict_proba(inference_array)
+            assets_to_tag = [
+                inference_asset_ids[i]
+                for i, prob in enumerate(predictions)
+                if prob >= threshold
+            ]
+
+            logger.info(
+                f"Tagging {len(assets_to_tag)} assets with '{ml_tag_name}' "
+                f"(threshold: {threshold})"
+            )
+
+            if assets_to_tag:
+                count = api.bulk_tag_assets(assets_to_tag, [ml_tag_id])
+                logger.info(f"Tagged {count} assets")
+
+    return True
+
+
+def run_training(min_samples: int = 10, threshold: float = 0.5, force: bool = False):
+    """
+    Run training for all eligible tags.
+
+    Args:
+        min_samples: Minimum positive samples required for training.
+        threshold: Prediction threshold for tagging.
+        force: If True, retrain all models even if training data hasn't changed.
+    """
+    config_store = ConfigStore()
+
+    # Ensure contrast tag exists
+    try:
+        api.create_tag(settings.contrast_tag)
+    except ValueError:
+        pass  # Already exists
+
+    contrast_tag = api.get_tag_by_name(settings.contrast_tag)
+    if not contrast_tag:
+        raise RuntimeError(
+            f"Could not find/create contrast tag '{settings.contrast_tag}'"
+        )
     contrast_tag_id = contrast_tag["id"]
 
+    # Get all tags
+    tags = api.get_tags()
+
+    trained_count = 0
     for tag in tags:
-        logger.info(f"Tag: {tag['name']}")
-        if tag["name"].endswith(ML_TAG_SUFFIX):
-            logger.info(f"Skipping tag {tag} as it is a predicted tag.")
-            continue
-        if tag["name"] == CONTRAST_TAG or tag["id"] == contrast_tag_id:
-            logger.info(f"Skipping tag {tag} as it is the contrast tag.")
-            continue
+        tag_name = tag["name"]
 
-        ml_tag_name = f"{tag['name']}{ML_TAG_SUFFIX}"
-        ml_tag_id = None
-        if ml_tag_name in tag_names:
-            logger.info(f"ML tag {ml_tag_name} already exists.")
-            ml_tag = next(t for t in tags if t["name"] == ml_tag_name)
-            ml_tag_id = ml_tag["id"]
-
-        ml_negative_tag_name = tag["name"]
-        ml_negative_tag_parent = contrast_tag_id
-        ml_negative_tag_id = None
-        try:
-            create_ml_tag(ml_negative_tag_name, ml_negative_tag_parent)
-        except Exception:
-            logger.info(
-                f"ML negative tag {ml_negative_tag_name} already exists or you need to create it in the UI."
-            )
-            pass
-        ml_negative_tag_id = next(
-            t
-            for t in config.tags
-            if t["name"] == ml_negative_tag_name
-            and t.get("parentId") == contrast_tag_id
-        )["id"]
-        logger.info(f"Using ML negative tag id {ml_negative_tag_id}")
-
-        tag_id = tag["id"]
-        logger.info(f"Processing tag {tag['name']} with id {tag_id}")
-        positive_asset_ids = get_assets_by_tag([tag_id])
-        negative_asset_ids_contrast = get_assets_by_tag([ml_negative_tag_id])
-        # remove assets that are only tagged with the predicted tag
-        if ml_tag_id is not None:
-            positive_asset_ids_ml = get_assets_by_tag([ml_tag_id])
-            positive_asset_ids = list(
-                set(positive_asset_ids) - set(positive_asset_ids_ml)
-            )
-
-        logger.info(f"Found {len(positive_asset_ids)} positive assets.")
-        if len(positive_asset_ids) < 10:
-            logger.info(f"Skipping tag {tag['name']} as it has less than 10 assets.")
+        # Skip predicted tags
+        if tag_name.endswith(settings.ml_tag_suffix):
+            logger.debug(f"Skipping '{tag_name}': is a predicted tag")
             continue
 
-        negative_asset_ids = get_random_asset_ids_without_tag(tag_id)
-        all_negative_asset_ids = negative_asset_ids.copy()
-        if len(negative_asset_ids) > 4 * len(positive_asset_ids):
-            negative_asset_ids = random.sample(
-                negative_asset_ids, 4 * len(positive_asset_ids)
-            )
-        negative_asset_ids += negative_asset_ids_contrast
-        logger.info(f"Selected {len(negative_asset_ids)} negative assets.")
+        # Skip contrast tag and its children
+        if tag_name == settings.contrast_tag or tag.get("parentId") == contrast_tag_id:
+            logger.debug(f"Skipping '{tag_name}': is contrast tag")
+            continue
 
-        embeddings_dict = get_embeddings_by_asset_ids(
-            positive_asset_ids + negative_asset_ids
-        )
-        positive_embeddings = np.array(
-            [
-                embeddings_dict[asset_id]
-                for asset_id in positive_asset_ids
-                if asset_id in embeddings_dict
-            ]
-        )
-        negative_embeddings = np.array(
-            [
-                embeddings_dict[asset_id]
-                for asset_id in negative_asset_ids
-                if asset_id in embeddings_dict
-            ]
-        )
-        logger.info(
-            f"Using {len(positive_embeddings)} positive and {len(negative_embeddings)} negative embeddings for training."
-        )
-        # Train model
-        classifier = BinaryEmbeddingClassifier()
-        accuracy = classifier.train(positive_embeddings, negative_embeddings)
-        logger.info(f"Trained model for tag {tag['name']} with accuracy {accuracy}")
-        # Save model
-        model_path = ML_RESOURCE_PATH / f"{tag['name']}{ML_TAG_SUFFIX}"
-        classifier.save(model_path)
-        logger.info(f"Saved model to {model_path}")
+        if train_single_tag(
+            tag, contrast_tag_id, config_store, min_samples, threshold, force
+        ):
+            trained_count += 1
 
-        if ml_tag_name not in tag_names:
-            create_ml_tag(ml_tag_name, tag_id)
-        elif ml_tag_id is not None:
-            delete_ml_tag(ml_tag_id)
-            while True:
-                try:
-                    create_ml_tag(ml_tag_name, tag_id)
-                    break
-                except Exception:
-                    logger.info(
-                        f"Waiting to recreate ML tag {ml_tag_name} after deletion..."
-                    )
-                    time.sleep(10)
-                    delete_ml_tag(ml_tag_id)
+    config_store.last_trained = datetime.now()
+    logger.info(f"Training complete. Trained {trained_count} models.")
+
+
+def run_inference(threshold: float = 0.5, incremental: bool = True):
+    """
+    Run inference using existing models on new assets.
+
+    Args:
+        threshold: Prediction threshold for tagging.
+        incremental: If True, only process assets added since last inference.
+    """
+    config_store = ConfigStore()
+    models = config_store.get_models()
+
+    if not models:
+        logger.warning("No trained models found. Run training first.")
+        return
+
+    # Get timestamp for incremental mode
+    since_timestamp = None
+    if incremental:
+        since_timestamp = config_store.last_inference
+        if since_timestamp:
+            logger.info(f"Running incremental inference since {since_timestamp}")
         else:
-            raise RuntimeError("ml_tag_id is None but tag exists")
+            logger.info("No previous inference timestamp, running full inference")
 
-        # getml_tag_id
-        tags = config.tags
-        ml_tag = next(t for t in tags if t["name"] == ml_tag_name)
+    # Get candidate assets (created since last inference if incremental)
+    candidate_asset_ids = get_asset_ids_created_since(since_timestamp)
+    logger.info(f"Found {len(candidate_asset_ids)} candidate assets to process")
+
+    if not candidate_asset_ids:
+        logger.info("No new assets to process")
+        config_store.last_inference = datetime.now()
+        return
+
+    for model_info in models:
+        tag_name = model_info.tag
+        model_path = model_info.model_path
+        ml_tag_name = f"{tag_name}{settings.ml_tag_suffix}"
+
+        logger.info(f"Running inference for '{tag_name}'")
+
+        # Load model
+        try:
+            classifier = BinaryEmbeddingClassifier.load(model_path)
+        except Exception as e:
+            logger.error(f"Failed to load model for '{tag_name}': {e}")
+            continue
+
+        # Get ML tag
+        ml_tag = api.get_tag_by_name(ml_tag_name)
+        if not ml_tag:
+            logger.warning(f"ML tag '{ml_tag_name}' not found, skipping")
+            continue
         ml_tag_id = ml_tag["id"]
 
-        # get_all_ids we can predict on
-        all_asset_ids = get_random_asset_ids_without_tag(tag_id, positive_asset_ids)
-        logger.info(f"Predicting on {len(all_asset_ids)} assets.")
-        all_embeddings = get_embeddings_by_asset_ids(all_asset_ids)
-        all_embeddings_array = np.array(
+        # Get original tag
+        original_tag = api.get_tag_by_name(tag_name)
+        if not original_tag:
+            logger.warning(f"Original tag '{tag_name}' not found, skipping")
+            continue
+
+        # Get assets already tagged
+        tagged_assets = set(api.get_assets_by_tag([original_tag["id"]]))
+        ml_tagged_assets = set(api.get_assets_by_tag([ml_tag_id]))
+
+        # Get assets to run inference on:
+        # - Must be in candidate set (new assets if incremental)
+        # - Must not already be tagged with original or ML tag
+        all_tagged = tagged_assets | ml_tagged_assets
+        inference_asset_ids = list(candidate_asset_ids - all_tagged)
+
+        logger.info(f"Running inference on {len(inference_asset_ids)} assets")
+
+        if not inference_asset_ids:
+            continue
+
+        # Get embeddings and predict
+        embeddings_dict = get_embeddings_by_asset_ids(inference_asset_ids)
+        embeddings_array = np.array(
             [
-                all_embeddings[asset_id]
-                for asset_id in all_asset_ids
-                if asset_id in all_embeddings
+                embeddings_dict[aid]
+                for aid in inference_asset_ids
+                if aid in embeddings_dict
             ]
         )
-        predictions = classifier.predict_proba(all_embeddings_array)
-        # assign tag to assets with prediction > 0.9
-        threshold = 0.5
+
+        if len(embeddings_array) == 0:
+            continue
+
+        predictions = classifier.predict_proba(embeddings_array)
         assets_to_tag = [
-            all_asset_ids[i] for i, prob in enumerate(predictions) if prob >= threshold
+            inference_asset_ids[i]
+            for i, prob in enumerate(predictions)
+            if prob >= threshold
         ]
-        logger.info(
-            f"Tagging {len(assets_to_tag)} assets with tag {ml_tag_name} (threshold {threshold})."
-        )
-        count = bulk_tag_assets(assets_to_tag, [ml_tag_id])
+
+        logger.info(f"Tagging {len(assets_to_tag)} assets with '{ml_tag_name}'")
+
+        if assets_to_tag:
+            count = api.bulk_tag_assets(assets_to_tag, [ml_tag_id])
+            logger.info(f"Tagged {count} assets")
+
+    config_store.last_inference = datetime.now()
+    logger.info("Inference complete.")
