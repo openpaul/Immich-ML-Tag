@@ -1,23 +1,25 @@
 # syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:python3.13-alpine AS builder
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 
 WORKDIR /app
 
 # Copy project files
 COPY pyproject.toml ./
 COPY src/ ./src/
+COPY README.md ./
 
 # Install dependencies and build the package
-RUN uv sync --frozen --no-dev && \
-    uv build
+RUN uv build
 
 # Runtime stage
-FROM python:3.13-alpine
+FROM python:3.13-slim-bookworm
 
 WORKDIR /app
 
 # Install runtime dependencies for psycopg2
-RUN apk add --no-cache libpq
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libpq5 && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy uv from builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
