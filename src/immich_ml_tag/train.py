@@ -68,7 +68,7 @@ class BinaryEmbeddingClassifier:
             class_weight="balanced",
             C=C,
             max_iter=5000,
-            n_jobs=-1,
+            n_jobs=1,  # Use single thread to avoid joblib/loky issues in containers
         )
 
         self.model.fit(X, y)
