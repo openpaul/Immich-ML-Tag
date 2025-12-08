@@ -458,8 +458,12 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
         return
 
     for model_info in models:
-        tag_name = model_info.tag
-        tag = api.get_tag_by_name(tag_name)
+        tag_id = model_info.tag_id
+        tag = api.get_tag_by_id(tag_id)
+        if not tag:
+            logger.warning(f"Tag ID '{tag_id}' not found, skipping")
+            continue
+        tag_name = tag["name"]
         if not tag:
             logger.warning(f"Tag '{tag_name}' not found, skipping")
             continue
@@ -468,7 +472,7 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
         ml_tag_name = f"{tag_name}{settings.ml_tag_suffix}"
 
         # Get ML tag
-        ml_tag = api.get_tag_by_name(ml_tag_name)
+        ml_tag = api.get_tag_by_name(ml_tag_name, parent_id=tag_id)
         if not ml_tag:
             logger.warning(f"ML tag '{ml_tag_name}' not found, skipping")
             continue
@@ -484,7 +488,7 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
                     break
                 except ValueError:
                     logger.debug("Waiting for tag deletion to propagate...")
-        else:
+        elif not ml_tag_id:
             api.create_tag(ml_tag_name, tag_id)
         ml_tag = api.get_tag_by_name(ml_tag_name)
         if not ml_tag:

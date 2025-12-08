@@ -187,7 +187,10 @@ def get_tag_by_name(name: str, parent_id: str | None = None) -> dict[str, Any] |
     Returns:
         The tag dict if found, None otherwise.
     """
-    logging.warning("get_tag_by_name is deprecated, use get_tag_by_id instead")
+    if not parent_id:
+        logger.warning(
+            "Searching for tag by name without parent_id may lead to ambiguous results."
+        )
     tags = get_tags()
     for tag in tags:
         if tag["name"] == name:
@@ -261,5 +264,4 @@ def get_assets_since(timestamp: str) -> list[str]:
         else:
             asset_ids.extend([asset["id"] for asset in assets["items"]])
             page += 1
-    print(asset_ids)
     return asset_ids

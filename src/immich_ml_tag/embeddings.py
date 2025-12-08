@@ -133,7 +133,11 @@ def get_asset_ids_created_since(
     asset_ids = get_all_asset_ids_with_embeddings()
     if since is not None:
         logging.info(f"Filtering assets created since {since.isoformat()}")
-        since = since - timedelta(hours=4)
+        try:
+            since = since - timedelta(hours=4)
+        except OverflowError:
+            since = datetime.min
+
         ids_added_since = get_assets_since(since.isoformat())
         asset_ids = asset_ids.intersection(set(ids_added_since))
     return asset_ids
