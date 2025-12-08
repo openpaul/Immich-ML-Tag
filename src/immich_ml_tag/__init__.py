@@ -35,6 +35,7 @@ def run_scheduler(
     inference_interval: int = 5,
     threshold: float = 0.5,
     min_samples: int = 10,
+    train_on_start: bool = False,
 ):
     """
     Run the scheduler service.
@@ -68,6 +69,18 @@ def run_scheduler(
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+
+    if train_on_start:
+        logger.info("Running initial training on startup...")
+        try:
+            run_training(
+                min_samples=min_samples,
+                threshold=threshold,
+                force=False,
+            )
+            last_train_date = datetime.now().date()
+        except Exception as e:
+            logger.error(f"Initial training failed: {e}")
 
     while running:
         now = datetime.now()
@@ -188,6 +201,11 @@ def main():
         default=DEFAULT_MIN_SAMPLES,
         help=f"Minimum positive samples required for training (default: {DEFAULT_MIN_SAMPLES}, env: MIN_SAMPLES)",
     )
+    serve_parser.add_argument(
+        "--train-on-start",
+        action="store_true",
+        help="Run training once on startup before entering the schedule loop",
+    )
 
     args = parser.parse_args()
 
@@ -214,6 +232,7 @@ def main():
             inference_interval=args.inference_interval,
             threshold=args.threshold,
             min_samples=args.min_samples,
+            train_on_start=args.train_on_start,
         )
 
 

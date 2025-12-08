@@ -44,4 +44,4 @@ ENV MIN_SAMPLES=10
 
 # Set entrypoint to serve mode by default
 ENTRYPOINT ["immich-ml-tag"]
-CMD ["serve"]
+CMD ["serve", "--train-on-start"]
