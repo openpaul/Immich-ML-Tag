@@ -1,7 +1,9 @@
 """Database operations for managing embeddings from Immich's PostgreSQL database."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
+import logging
 
+from immich_ml_tag.api import get_assets_since
 import numpy as np
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -127,24 +129,11 @@ def get_asset_ids_created_since(
     Returns:
         Set of asset IDs.
     """
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        if since is None:
-            cur.execute('SELECT "assetId" FROM smart_search')
-        else:
-            # Join with assets table to filter by createdAt
-            cur.execute(
-                """
-                SELECT ss."assetId"
-                FROM smart_search ss
-                JOIN assets a ON ss."assetId" = a.id
-                WHERE a."createdAt" > %s
-                """,
-                (since,),
-            )
-        asset_ids = {str(row[0]) for row in cur.fetchall()}
-        cur.close()
-        return asset_ids
-    finally:
-        conn.close()
+
+    asset_ids = get_all_asset_ids_with_embeddings()
+    if since is not None:
+        logging.info(f"Filtering assets created since {since.isoformat()}")
+        since = since - timedelta(hours=4)
+        ids_added_since = get_assets_since(since.isoformat())
+        asset_ids = asset_ids.intersection(set(ids_added_since))
+    return asset_ids

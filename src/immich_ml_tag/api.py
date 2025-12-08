@@ -210,3 +210,46 @@ def ensure_tag_exists(name: str, parent_id: str | None = None) -> str:
     if tag:
         return tag["id"]
     return create_tag(name, parent_id)
+
+
+def get_assets_since(timestamp: str) -> list[str]:
+    """
+    Get asset IDs created since a given timestamp.
+
+    Args:
+        timestamp: ISO 8601 formatted timestamp (DateTime).
+
+    Returns:
+        List of asset IDs.
+    """
+
+    def _get_assets_page(timestamp: str, page: int) -> dict[str, Any]:
+        response = requests.post(
+            f"{settings.immich_url}/api/search/metadata",
+            headers=get_headers(),
+            json={
+                "createdAfter": timestamp,
+                "page": page,
+            },
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return result["assets"]
+        else:
+            raise ValueError(
+                f"Error fetching assets since {timestamp}: {response.text}"
+            )
+
+    asset_ids = []
+    page = 1
+    while True:
+        assets = _get_assets_page(timestamp, page)
+        if not assets or "items" not in assets:
+            break
+        elif len(assets["items"]) == 0:
+            break
+        else:
+            asset_ids.extend([asset["id"] for asset in assets["items"]])
+            page += 1
+    print(asset_ids)
+    return asset_ids

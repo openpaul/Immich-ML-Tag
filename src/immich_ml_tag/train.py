@@ -444,6 +444,8 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
             logger.info(f"Running incremental inference since {since_timestamp}")
         else:
             logger.info("No previous inference timestamp, running full inference")
+    else:
+        logger.info("Running full inference on all assets")
 
     # Get candidate assets (created since last inference if incremental)
     candidate_asset_ids = get_asset_ids_created_since(since_timestamp)
@@ -451,7 +453,6 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
 
     if not candidate_asset_ids:
         logger.info("No new assets to process")
-        config_store.last_inference = datetime.now()
         return
 
     for model_info in models:
