@@ -230,7 +230,7 @@ def train_single_tag(
     logger.info(f"Processing tag '{tag_name}' (id: {tag_id})")
 
     # Get ML tag if it exists
-    ml_tag = api.get_tag_by_name(ml_tag_name)
+    ml_tag = api.get_tag_by_id(ml_tag_name, parent_id=tag_id)
     ml_tag_id = ml_tag["id"] if ml_tag else None
 
     # Get or create negative examples tag under contrast parent
@@ -266,7 +266,7 @@ def train_single_tag(
     current_hash = compute_training_data_hash(
         positive_asset_ids, manual_negative_asset_ids
     )
-    stored_hash = config_store.get_training_data_hash(tag_name)
+    stored_hash = config_store.get_training_data_hash(tag_id=tag_id)
 
     if not force and stored_hash == current_hash:
         logger.info(
@@ -310,7 +310,7 @@ def train_single_tag(
     # Save model with training data hash
     model_path = settings.ml_resource_path / ml_tag_name
     classifier.save(model_path)
-    config_store.register_model(tag_name, model_path, current_hash)
+    config_store.register_model(tag_id, model_path, current_hash)
     logger.info(f"Saved model to {model_path}")
 
     # Manage ML tag (delete and recreate to clear old predictions)
@@ -446,6 +446,8 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
             logger.info("No previous inference timestamp, running full inference")
     else:
         logger.info("Running full inference on all assets")
+        # meaning we delete the old timestamp and the old ML tags
+        config_store.last_inference = datetime.min
 
     # Get candidate assets (created since last inference if incremental)
     candidate_asset_ids = get_asset_ids_created_since(since_timestamp)
@@ -457,8 +459,38 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
 
     for model_info in models:
         tag_name = model_info.tag
+        tag = api.get_tag_by_name(tag_name)
+        if not tag:
+            logger.warning(f"Tag '{tag_name}' not found, skipping")
+            continue
+        tag_id = tag["id"]
         model_path = model_info.model_path
         ml_tag_name = f"{tag_name}{settings.ml_tag_suffix}"
+
+        # Get ML tag
+        ml_tag = api.get_tag_by_name(ml_tag_name)
+        if not ml_tag:
+            logger.warning(f"ML tag '{ml_tag_name}' not found, skipping")
+            continue
+        ml_tag_id = ml_tag["id"]
+
+        if ml_tag_id and incremental is False:
+            api.delete_tag(ml_tag_id)
+            # Wait for deletion to propagate
+            for _ in range(5):
+                time.sleep(2)
+                try:
+                    api.create_tag(ml_tag_name, tag_id)
+                    break
+                except ValueError:
+                    logger.debug("Waiting for tag deletion to propagate...")
+        else:
+            api.create_tag(ml_tag_name, tag_id)
+        ml_tag = api.get_tag_by_name(ml_tag_name)
+        if not ml_tag:
+            logger.error(f"Failed to create ML tag '{ml_tag_name}'")
+            continue
+        ml_tag_id = ml_tag["id"]
 
         logger.info(f"Running inference for '{tag_name}'")
 
@@ -468,13 +500,6 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
         except Exception as e:
             logger.error(f"Failed to load model for '{tag_name}': {e}")
             continue
-
-        # Get ML tag
-        ml_tag = api.get_tag_by_name(ml_tag_name)
-        if not ml_tag:
-            logger.warning(f"ML tag '{ml_tag_name}' not found, skipping")
-            continue
-        ml_tag_id = ml_tag["id"]
 
         # Get original tag
         original_tag = api.get_tag_by_name(tag_name)

@@ -187,9 +187,19 @@ def get_tag_by_name(name: str, parent_id: str | None = None) -> dict[str, Any] |
     Returns:
         The tag dict if found, None otherwise.
     """
+    logging.warning("get_tag_by_name is deprecated, use get_tag_by_id instead")
     tags = get_tags()
     for tag in tags:
         if tag["name"] == name:
+            if parent_id is None or tag.get("parentId") == parent_id:
+                return tag
+    return None
+
+
+def get_tag_by_id(tag_id: str, parent_id: str | None = None) -> dict[str, Any] | None:
+    tags = get_tags()
+    for tag in tags:
+        if tag["id"] == tag_id:
             if parent_id is None or tag.get("parentId") == parent_id:
                 return tag
     return None

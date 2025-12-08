@@ -64,9 +64,10 @@ settings = Settings()
 class Model:
     """Represents a trained ML model for a specific tag."""
 
-    tag: str
+    tag_id: str
     model_path: Path
     last_trained: datetime | None = None
+    training_data_hash: str | None = None
 
 
 class ConfigStore:
@@ -88,7 +89,7 @@ class ConfigStore:
             )
         """)
         self.cur.execute(
-            "CREATE TABLE IF NOT EXISTS models (tag TEXT PRIMARY KEY, model_path TEXT, training_data_hash TEXT)"
+            "CREATE TABLE IF NOT EXISTS models (tag TEXT PRIMARY KEY, tag_id TEXT, model_path TEXT, training_data_hash TEXT)"
         )
         self.conn.commit()
 
@@ -103,28 +104,37 @@ class ConfigStore:
 
     def get_models(self) -> list[Model]:
         """Get all registered models."""
-        self.cur.execute("SELECT tag, model_path FROM models")
+        self.cur.execute("SELECT tag_id, model_path, training_data_hash FROM models")
         data = self.cur.fetchall()
         models = []
-        for tag, model_path in data:
-            models.append(Model(tag=tag, model_path=Path(model_path)))
+        for tag_id, model_path, training_data_hash in data:
+            models.append(
+                Model(
+                    tag_id=tag_id,
+                    model_path=Path(model_path),
+                    training_data_hash=training_data_hash,
+                )
+            )
         return models
 
     def register_model(
-        self, tag: str, model_path: Path, training_data_hash: str | None = None
+        self,
+        tag_id: str,
+        model_path: Path,
+        training_data_hash: str | None = None,
     ):
         """Register or update a model in the database."""
         self.cur.execute(
-            "INSERT OR REPLACE INTO models (tag, model_path, training_data_hash) VALUES (?, ?, ?)",
-            (tag, str(model_path), training_data_hash),
+            "INSERT OR REPLACE INTO models (tag_id, model_path, training_data_hash) VALUES (?, ?, ?)",
+            (tag_id, str(model_path), training_data_hash),
         )
         self.conn.commit()
 
-    def get_training_data_hash(self, tag: str) -> str | None:
+    def get_training_data_hash(self, tag_id: str) -> str | None:
         """Get the training data hash for a specific tag."""
         self.cur.execute(
-            "SELECT training_data_hash FROM models WHERE tag = ?",
-            (tag,),
+            "SELECT training_data_hash FROM models WHERE tag_id = ?",
+            (tag_id,),
         )
         data = self.cur.fetchone()
         if data is None or data[0] is None:
