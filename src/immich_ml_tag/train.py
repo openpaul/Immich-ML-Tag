@@ -328,7 +328,7 @@ def train_single_tag(
         api.create_tag(ml_tag_name, tag_id)
 
     # Get the new ML tag ID
-    ml_tag = api.get_tag_by_name(ml_tag_name)
+    ml_tag = api.get_tag_by_name(ml_tag_name, parent_id=tag_id)
     if not ml_tag:
         logger.error(f"Failed to create ML tag '{ml_tag_name}'")
         return False
@@ -490,7 +490,7 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
                     logger.debug("Waiting for tag deletion to propagate...")
         elif not ml_tag_id:
             api.create_tag(ml_tag_name, tag_id)
-        ml_tag = api.get_tag_by_name(ml_tag_name)
+        ml_tag = api.get_tag_by_name(ml_tag_name, parent_id=tag_id)
         if not ml_tag:
             logger.error(f"Failed to create ML tag '{ml_tag_name}'")
             continue
@@ -506,7 +506,7 @@ def run_inference(threshold: float = 0.5, incremental: bool = True):
             continue
 
         # Get original tag
-        original_tag = api.get_tag_by_name(tag_name)
+        original_tag = api.get_tag_by_id(tag_id)
         if not original_tag:
             logger.warning(f"Original tag '{tag_name}' not found, skipping")
             continue
