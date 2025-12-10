@@ -12,37 +12,39 @@ class Settings:
     """Environment-based settings for the application."""
 
     immich_db: str = field(
-        default_factory=lambda: os.environ.get("IMMICH_DB_DATABASE_NAME", "immich")
+        default_factory=lambda: os.environ.get("DB_DATABASE_NAME", "immich")
     )
     immich_db_user: str = field(
-        default_factory=lambda: os.environ.get("IMMICH_DB_USERNAME", "postgres")
+        default_factory=lambda: os.environ.get("DB_USERNAME", "postgres")
     )
     immich_db_password: str = field(
-        default_factory=lambda: os.environ.get("IMMICH_DB_PASSWORD", "yourpassword")
+        default_factory=lambda: os.environ.get("DB_PASSWORD", "yourpassword")
     )
     immich_db_host: str = field(
-        default_factory=lambda: os.environ.get("IMMICH_DB_HOST", "localhost")
+        default_factory=lambda: os.environ.get("DB_HOST", "localhost")
     )
     immich_db_port: str = field(
-        default_factory=lambda: os.environ.get("IMMICH_DB_PORT", "5433")
+        default_factory=lambda: os.environ.get("DB_PORT", "5432")
     )
     immich_api_key: str = field(
-        default_factory=lambda: os.environ.get("IMMICH_API_KEY", "your_api_key")
+        default_factory=lambda: os.environ.get("API_KEY", "your_api_key")
     )
     immich_url: str = field(
-        default_factory=lambda: os.environ.get(
-            "IMMICH_URL", "https://immich.example.com"
-        )
+        default_factory=lambda: os.environ.get("URL", "https://immich.example.com")
     )
     ml_resource_path: Path = field(
         default_factory=lambda: Path(
             os.environ.get("ML_RESOURCE_PATH", "./ml_resources")
         )
     )
-
-    # Tag naming conventions
-    ml_tag_suffix: str = "_predicted"
-    contrast_tag: str = "ML Negative Examples"
+    ml_tag_suffix: str = field(
+        default_factory=lambda: os.environ.get("ML_TAG_SUFFIX", "_predicted")
+    )
+    contrast_tag: str = field(
+        default_factory=lambda: os.environ.get(
+            "ML_TAG_NEGATIVE_NAME", "z_ml_negative_examples"
+        )
+    )
 
     def __post_init__(self):
         self.ml_resource_path = Path(self.ml_resource_path)
@@ -89,9 +91,8 @@ class ConfigStore:
             )
         """)
         self.cur.execute(
-            "CREATE TABLE IF NOT EXISTS models (tag TEXT PRIMARY KEY, tag_id TEXT, model_path TEXT, training_data_hash TEXT)"
+            "CREATE TABLE IF NOT EXISTS models (tag_id TEXT PRIMARY KEY, model_path TEXT, training_data_hash TEXT)"
         )
-        self.conn.commit()
 
     def close(self):
         """Close the database connection."""
@@ -128,6 +129,11 @@ class ConfigStore:
             "INSERT OR REPLACE INTO models (tag_id, model_path, training_data_hash) VALUES (?, ?, ?)",
             (tag_id, str(model_path), training_data_hash),
         )
+        self.conn.commit()
+
+    def unregister_model(self, tag_id: str):
+        """Unregister a model from the database."""
+        self.cur.execute("DELETE FROM models WHERE tag_id = ?", (tag_id,))
         self.conn.commit()
 
     def get_training_data_hash(self, tag_id: str) -> str | None:

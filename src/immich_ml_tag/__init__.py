@@ -154,6 +154,12 @@ def main():
         action="store_true",
         help="Force retraining even if training data hasn't changed",
     )
+    train_parser.add_argument(
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="Perform a dry run without saving models or tags",
+    )
 
     # Inference command
     inference_parser = subparsers.add_parser(
@@ -220,6 +226,7 @@ def main():
             min_samples=args.min_samples,
             threshold=args.threshold,
             force=args.force,
+            dry_run=args.dry_run,
         )
     elif args.command == "inference":
         run_inference(

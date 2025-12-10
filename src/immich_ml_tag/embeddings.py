@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 import logging
 
-from immich_ml_tag.api import get_assets_since
+from immich_ml_tag.api import api
 import numpy as np
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -12,15 +12,20 @@ from .config import settings
 
 
 def get_connection():
-    """Create a connection to the Immich PostgreSQL database."""
-    conn = psycopg2.connect(
-        dbname=settings.immich_db,
-        user=settings.immich_db_user,
-        password=settings.immich_db_password,
-        host=settings.immich_db_host,
-        port=settings.immich_db_port,
-    )
-    register_vector(conn)
+    """Create a read-only connection to the Immich PostgreSQL database."""
+    try:
+        conn = psycopg2.connect(
+            dbname=settings.immich_db,
+            user=settings.immich_db_user,
+            password=settings.immich_db_password,
+            host=settings.immich_db_host,
+            port=settings.immich_db_port,
+            options="-c default_transaction_read_only=on",
+        )
+        register_vector(conn)
+    except Exception as e:
+        logging.error(f"Error connecting to Immich database: {e}")
+        raise
     return conn
 
 
@@ -91,7 +96,7 @@ def get_all_asset_ids_with_embeddings() -> set[str]:
 
 
 def get_asset_ids_without_tag(
-    tagged_asset_ids: set[str],
+    tagged_asset_ids: set[str] | list[str],
     exclude_asset_ids: set[str] | None = None,
 ) -> list[str]:
     """
@@ -105,6 +110,8 @@ def get_asset_ids_without_tag(
         List of asset IDs without the tag.
     """
     all_asset_ids = get_all_asset_ids_with_embeddings()
+    if isinstance(tagged_asset_ids, list):
+        tagged_asset_ids = set(tagged_asset_ids)
 
     # Filter out assets that have the tag
     assets_without_tag = all_asset_ids - tagged_asset_ids
@@ -138,6 +145,6 @@ def get_asset_ids_created_since(
         except OverflowError:
             since = datetime.min
 
-        ids_added_since = get_assets_since(since.isoformat())
+        ids_added_since = api.get_assets_since(since.isoformat())
         asset_ids = asset_ids.intersection(set(ids_added_since))
     return asset_ids
