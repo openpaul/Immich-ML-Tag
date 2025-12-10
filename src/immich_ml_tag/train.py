@@ -64,12 +64,11 @@ class BinaryEmbeddingClassifier:
         sample_weight = np.concatenate(weights)
 
         self.model = LogisticRegression(
-            penalty="l2",
             solver="lbfgs",
             class_weight="balanced",
             C=C,
+            l1_ratio=0,
             max_iter=5000,
-            n_jobs=1,
         )
         self.model.fit(X, y, sample_weight=sample_weight)
         preds = self.model.predict(X)
